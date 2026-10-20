@@ -51,7 +51,11 @@ static const char *TAG = "link.image";
 // On boards with the full UI, mbedTLS allocates from PSRAM, so HTTPS only adds a little
 // socket state and needs no large internal block. The display backends keep
 // the sizes they were tuned with.
-#define FETCH_TLS_BYTES     (8 * 1024)
+// 4 KB, not 8: at 8 the gate (stack 8K + reserve 4K + this) landed at 20,480,
+// within ~50 bytes of the 2.16's steady-state free internal heap (~20,427),
+// so downloads were refused at rest even though the real internal cost with
+// PSRAM-backed TLS is just socket state.
+#define FETCH_TLS_BYTES     (4 * 1024)
 #define FETCH_TLS_BLOCK     1
 #else
 #define FETCH_TLS_BYTES     (26 * 1024)
