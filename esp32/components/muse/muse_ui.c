@@ -1768,9 +1768,12 @@ bool muse_ui_image_draw(int x, int y, int w, int h, const uint16_t *pixels)
             xSemaphoreGive(s_image_mutex);
             return false;
         }
-        /* Now, not when it's shown: asleep, the display may be paused (muse_input.c). */
-        muse_state_set_asleep(false);
     }
+    /* Every image wakes the display, not just the first: the buffer persists
+     * across sleep (freed only on dismiss), so gating the wake on a fresh
+     * allocation meant later images drew into a sleeping display and the
+     * user had to tap to see them. */
+    muse_state_set_asleep(false);
     const uint8_t *src = (const uint8_t *)pixels;
     for (int row = 0; row < h; row++) {
         uint16_t *dst = s_image_buf + (size_t)(y + row) * s_w + x;
