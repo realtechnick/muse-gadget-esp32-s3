@@ -182,6 +182,9 @@ static std::atomic<bool> s_power_save{false};
 // Session-task-owned: written before the event loop, read/reset within it.
 static char s_register_req_id[40] = {0};
 static bool s_register_acked = false;
+/* Set when the server refuses this session's link.register; the event loop
+ * turns it into a session-ending auth failure (see the check after RX). */
+static bool s_register_rejected = false;
 static bool s_heartbeat_registered = false;
 static TaskHandle_t s_task = nullptr;
 
@@ -1917,6 +1920,7 @@ static void process_inbound_body_chunk(
                             ESP_LOGE(TAG, "link.register rejected: %s",
                                      cJSON_IsString(reason) && reason->valuestring
                                          ? reason->valuestring : "no reason given");
+                            s_register_rejected = true;
                         } else {
                             s_register_acked = true;
                             ESP_LOGI(TAG, "link.register acked; tunnel may open");
@@ -2091,6 +2095,7 @@ static session_result_t run_session(stack_monitor_t *stack) {
     // under DMA pressure while the event loop services RX and WS keepalives.
     {
         s_register_acked = false;
+        s_register_rejected = false;
         s_heartbeat_registered = false;
         char *reg_json = build_register_json();
         if (!reg_json) {
@@ -2245,6 +2250,18 @@ static session_result_t run_session(stack_monitor_t *stack) {
             last_activity_us = last_rx_us;
         }
         // n == -2: no data available, continue
+
+        // A refused link.register is an auth failure, not a network blip:
+        // the session is up but unregistered, so the tunnel never opens, no
+        // invoke can be routed here, and nothing on this session can fix it.
+        // End it as SESSION_AUTH_FAILED so app.c re-fetches the VM token
+        // (ws_auth_failed) and the reconnect re-registers with fresh
+        // credentials, instead of sitting at "Connecting" forever.
+        if (s_register_rejected) {
+            result = SESSION_AUTH_FAILED;
+            error = true;
+            break;
+        }
 
         // TX: keep exactly one control message in flight across loop turns.
         // A paused slot prevents dequeue/serialization of the next result.
