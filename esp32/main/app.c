@@ -82,6 +82,10 @@
 #if CONFIG_MUSE_ENABLED
 #include "muse_glue.h"
 #include "muse_input.h"
+#include "muse_audio.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "minimp3.h"
 // Muse joins Wi-Fi from its own settings, before or without pairing.
 #define WIFI_WITHOUT_PAIRING 1
 #else
@@ -1574,6 +1578,190 @@ static void draw_url_done(const image_fetch_result_t *r, void *user) {
 }
 #endif
 
+#if CONFIG_HOMEHUB_DISPLAY_COMMANDS
+// ---- audio.play_url: download an MP3 and play it through the speaker ----
+
+typedef struct {
+    noise_ctrl_session_generation_t session_generation;
+    char request_id[64];
+    char *url;
+} audio_play_url_args_t;
+
+// One announcement at a time; a second command while one plays gets "busy".
+static bool s_audio_playing;
+
+#define AUDIO_PLAY_URL_MAX_BYTES (1024 * 1024)  /* announcements are short; refuse larger files */
+
+// Linear resampler; mirrors the one in components/muse/muse_chat_session.cpp.
+typedef struct {
+    uint32_t step;
+    uint32_t pos;
+    int16_t prev;
+} audio_resampler_t;
+
+static void audio_resampler_init(audio_resampler_t *r, int in_rate, int out_rate)
+{
+    r->step = (uint32_t)(((uint64_t)in_rate << 16) / out_rate);
+    r->pos = 0;
+    r->prev = 0;
+}
+
+static size_t audio_resample(audio_resampler_t *r, const int16_t *in, size_t n, int16_t *out)
+{
+    size_t o = 0;
+    if (!n) {
+        return 0;
+    }
+    while ((r->pos >> 16) < n) {
+        size_t i = r->pos >> 16;
+        int32_t a = i ? in[i - 1] : r->prev;
+        int32_t b = in[i];
+        out[o++] = (int16_t)(a + (int32_t)(((int64_t)(b - a) * (int64_t)(r->pos & 0xffff)) >> 16));
+        r->pos += r->step;
+    }
+    r->pos -= n << 16;
+    r->prev = in[n - 1];
+    return o;
+}
+
+static void audio_play_url_task(void *arg)
+{
+    audio_play_url_args_t *args = arg;
+    const char *error_code = NULL;
+    const char *error_message = NULL;
+    uint8_t *mp3 = NULL;
+    size_t mp3_len = 0;
+    size_t played_frames = 0;
+    esp_http_client_handle_t client = NULL;
+
+    esp_http_client_config_t cfg = {
+        .url = args->url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 15000,
+        .buffer_size = 4096,
+    };
+    client = esp_http_client_init(&cfg);
+    if (!client) {
+        error_code = "out_of_memory";
+        error_message = "failed to start download";
+        goto done;
+    }
+    if (esp_http_client_open(client, 0) != ESP_OK) {
+        error_code = "download_failed";
+        error_message = "failed to open URL";
+        goto done;
+    }
+    {
+        int content_len = esp_http_client_fetch_headers(client);
+        if (content_len > (int)AUDIO_PLAY_URL_MAX_BYTES) {
+            error_code = "file_too_large";
+            error_message = "MP3 is larger than the 1 MB cap";
+            goto done;
+        }
+        mp3 = heap_caps_malloc(AUDIO_PLAY_URL_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!mp3) {
+            error_code = "out_of_memory";
+            error_message = "failed to allocate download buffer";
+            goto done;
+        }
+        int n;
+        while ((n = esp_http_client_read(client, (char *)mp3 + mp3_len,
+                                         AUDIO_PLAY_URL_MAX_BYTES - mp3_len)) > 0) {
+            mp3_len += (size_t)n;
+            if (mp3_len >= AUDIO_PLAY_URL_MAX_BYTES) {
+                error_code = "file_too_large";
+                error_message = "MP3 is larger than the 1 MB cap";
+                goto done;
+            }
+        }
+        if (n < 0) {
+            error_code = "download_failed";
+            error_message = "download read failed";
+            goto done;
+        }
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    client = NULL;
+
+    {
+        mp3dec_t dec;
+        mp3dec_init(&dec);
+        static int16_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME * 2];
+        static int16_t out[4096];
+        audio_resampler_t rs = {0};
+        int rate = 0;
+        size_t off = 0;
+        bool any = false;
+        while (off < mp3_len) {
+            mp3dec_frame_info_t info;
+            int samples = mp3dec_decode_frame(&dec, mp3 + off, mp3_len - off, pcm, &info);
+            if (!info.frame_bytes) {
+                break;
+            }
+            off += info.frame_bytes;
+            if (!samples || info.hz <= 0) {
+                continue;
+            }
+            any = true;
+            if (info.channels == 2) {
+                for (int k = 0; k < samples; k++) {
+                    pcm[k] = (int16_t)((pcm[2 * k] + pcm[2 * k + 1]) / 2);
+                }
+            }
+            if (rate != info.hz) {
+                rate = info.hz;
+                audio_resampler_init(&rs, info.hz, MUSE_AUDIO_RATE);
+            }
+            size_t n = audio_resample(&rs, pcm, (size_t)samples, out);
+            size_t done_frames = 0;
+            while (done_frames < n) {
+                size_t chunk = n - done_frames > MUSE_AUDIO_CHUNK ? MUSE_AUDIO_CHUNK : n - done_frames;
+                if (muse_audio_write(out + done_frames, chunk) != ESP_OK) {
+                    error_code = "playback_failed";
+                    error_message = "speaker write failed";
+                    goto done;
+                }
+                done_frames += chunk;
+                played_frames += chunk;
+            }
+        }
+        if (!any) {
+            error_code = "decode_failed";
+            error_message = "no audio frames decoded from the MP3";
+            goto done;
+        }
+    }
+
+done:
+    if (client) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+    }
+    {
+        cJSON *result = cJSON_CreateObject();
+        if (!error_code) {
+            cJSON_AddBoolToObject(result, "ok", true);
+            cJSON *payload = cJSON_AddObjectToObject(result, "payload");
+            cJSON_AddNumberToObject(payload, "seconds", (double)played_frames / MUSE_AUDIO_RATE);
+            cJSON_AddNumberToObject(payload, "bytes", (double)mp3_len);
+        } else {
+            cJSON_AddBoolToObject(result, "ok", false);
+            cJSON *error = cJSON_AddObjectToObject(result, "error");
+            cJSON_AddStringToObject(error, "code", error_code);
+            cJSON_AddStringToObject(error, "message", error_message);
+        }
+        noise_ctrl_send_command_result(args->session_generation, args->request_id, result);
+    }
+    free(mp3);
+    free(args->url);
+    free(args);
+    s_audio_playing = false;
+    stack_monitor_record(NULL);
+    vTaskDeleteWithCaps(NULL);
+}
+#endif
+
 #if CONFIG_MUSE_WATCHER_CAMERA
 typedef struct {
     noise_ctrl_session_generation_t session_generation;
@@ -1902,6 +2090,36 @@ static cJSON *on_ws_command(
         cJSON *result = cJSON_CreateObject();
         cJSON_AddBoolToObject(result, "ok", true);
         return result;
+    }
+    if (strcmp(command, "audio.play_url") == 0) {
+        char *url = json_strdup_string(params, "url");
+        if (!url || !url[0]) {
+            free(url);
+            return command_error("missing_param", "url is required");
+        }
+        if (s_audio_playing) {
+            free(url);
+            return command_error("busy", "audio is already playing");
+        }
+        audio_play_url_args_t *args = calloc(1, sizeof(*args));
+        if (!args) {
+            free(url);
+            return command_error("out_of_memory", "failed to allocate");
+        }
+        args->session_generation = session_generation;
+        strncpy(args->request_id, request_id, sizeof(args->request_id) - 1);
+        args->url = url;
+        s_audio_playing = true;
+        if (xTaskCreateWithCaps(audio_play_url_task, "audio_play_url", 32768,
+                                args, 4, NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+            s_audio_playing = false;
+            free(args->url);
+            free(args);
+            return command_error("out_of_memory", "failed to start audio playback");
+        }
+        cJSON *async = cJSON_CreateObject();
+        cJSON_AddBoolToObject(async, "_async", true);
+        return async;
     }
 #endif
 #if CONFIG_MUSE_WATCHER_CAMERA

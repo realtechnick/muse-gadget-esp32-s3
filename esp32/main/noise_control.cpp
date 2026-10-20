@@ -1447,6 +1447,19 @@ static char *build_register_json(void) {
         cJSON_AddNumberToObject(
             cJSON_GetObjectItem(commands, "display.draw_url"), "timeout_ms",
             bits == 4 ? 120000 : 60000);
+        {
+            cJSON *audio_required = cJSON_CreateObject();
+            cJSON_AddItemToObject(audio_required, "url",
+                                  string_param("http:// or https:// URL of an MP3 to play through the speaker. "
+                                               "For announcements and pre-rendered audio."));
+            add_command(commands, "audio.play_url",
+                        "Download an MP3 from a URL and play it through the speaker. "
+                        "For announcements and pre-rendered audio (replies themselves are text-only). "
+                        "Returns the seconds played.",
+                        audio_required, nullptr);
+            cJSON_AddNumberToObject(
+                cJSON_GetObjectItem(commands, "audio.play_url"), "timeout_ms", 120000);
+        }
         add_command(commands, "display.show_animation",
                     epaper ? "Clear the image and bring back the status screen "
                            "and the agent's name."

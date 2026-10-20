@@ -75,6 +75,7 @@ set(GADGET_REQUIRES
     mbedtls
     efuse
     muse
+    minimp3
     # The voice board's. Requirements are resolved before the configuration
     # is loaded, so this is unconditional; unused code is not linked.
     esp_driver_i2s
