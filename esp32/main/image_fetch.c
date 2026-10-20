@@ -318,11 +318,90 @@ static esp_err_t open_following_redirects(fetch_t *f, int *status) {
     }
 }
 
+
+// Retry on low memory: if the heap is under the threshold, wait and re-check
+// instead of refusing outright. Uses an esp_timer (no task stack overhead) so
+// the retry itself doesn't consume the memory it's waiting for.
+#define FETCH_RETRY_COUNT    3
+#define FETCH_RETRY_DELAY_US (5000 * 1000)
+
+typedef struct {
+    char *url;
+    int row;
+    image_fetch_done_cb done;
+    void *user;
+    bool https;
+    int width, height;
+    esp_timer_handle_t timer;
+    int retries;
+} fetch_retry_args_t;
+
+static void fetch_retry_timer_cb(void *arg);
+static void fetch_task(void *arg);
+
+static bool fetch_retry_check_and_start(fetch_retry_args_t *ra) {
+    bool https = ra->https;
+    size_t stack = https ? FETCH_TLS_STACK : FETCH_STACK_BYTES;
+    size_t need = stack + FETCH_RESERVE_BYTES
+                + (https ? FETCH_TLS_BYTES : FETCH_HTTP_BYTES);
+    size_t block = heap_caps_get_largest_free_block(BYTE_CAPS);
+    if (internal_free() >= need && block >= stack
+        && (!https || block >= FETCH_TLS_BLOCK)) {
+        fetch_t *f = calloc(1, sizeof(*f));
+        if (f) f->url = ra->url;  /* transfer ownership */
+        if (f && f->url) {
+            f->https = https;
+            f->row = ra->row;
+            f->done = ra->done;
+            f->user = ra->user;
+            f->width = ra->width;
+            f->height = ra->height;
+            if (xTaskCreate(fetch_task, "image", stack, f, 4, NULL) == pdPASS) {
+                esp_timer_delete(ra->timer);
+                free(ra);
+                return true;
+            }
+            free(f->url);
+            free(f);
+        } else {
+            free(f);
+        }
+    }
+    return false;
+}
+
+static void fetch_retry_timer_cb(void *arg) {
+    fetch_retry_args_t *ra = arg;
+    if (fetch_retry_check_and_start(ra)) {
+        return;  /* download started, ra freed */
+    }
+    ra->retries++;
+    if (ra->retries >= FETCH_RETRY_COUNT) {
+        log_memory("image download refused after retries");
+        image_fetch_result_t result = {
+            .ok = false,
+            .code = "out_of_memory",
+            .message = ra->https ? "not enough free memory for an HTTPS download; try http://"
+                                 : "not enough free memory for a download",
+        };
+        ra->done(&result, ra->user);
+        esp_timer_delete(ra->timer);
+        free(ra->url);
+        free(ra);
+        atomic_store(&s_busy, false);
+        return;
+    }
+    ESP_LOGI(TAG, "image download retry %d/%d: still low on memory",
+             ra->retries, FETCH_RETRY_COUNT);
+    esp_timer_start_once(ra->timer, FETCH_RETRY_DELAY_US);
+}
+
 static void fetch_task(void *arg) {
     fetch_t *f = arg;
     int64_t start = esp_timer_get_time();
     f->deadline_us = start + FETCH_DEADLINE_MS * 1000LL;
     image_fetch_result_t result = { .code = "download_failed" };
+
     log_memory("image download start");
 
     esp_http_client_config_t cfg = {
@@ -427,12 +506,40 @@ bool image_fetch_start(const char *url, int row, image_fetch_done_cb done,
     size_t block = heap_caps_get_largest_free_block(BYTE_CAPS);
     if (internal_free() < need || block < stack
         || (https && block < FETCH_TLS_BLOCK)) {
-        log_memory("image download refused");
-        atomic_store(&s_busy, false);
-        *code = "out_of_memory";
-        *message = https ? "not enough free memory for an HTTPS download; try http://"
-                         : "not enough free memory for a download";
-        return false;
+        log_memory("image download waiting for memory");
+        fetch_retry_args_t *ra = calloc(1, sizeof(*ra));
+        if (ra) ra->url = strdup(url);
+        if (!ra || !ra->url) {
+            free(ra);
+            atomic_store(&s_busy, false);
+            *code = "out_of_memory";
+            *message = "failed to allocate";
+            return false;
+        }
+        ra->row = row;
+        ra->done = done;
+        ra->user = user;
+        ra->https = https;
+        ra->width = width;
+        ra->height = height;
+        ra->retries = 0;
+        /* s_busy stays set; the retry timer clears it or hands off to fetch_task. */
+        const esp_timer_create_args_t targs = {
+            .callback = fetch_retry_timer_cb,
+            .arg = ra,
+            .name = "image_retry",
+        };
+        if (esp_timer_create(&targs, &ra->timer) != ESP_OK
+            || esp_timer_start_once(ra->timer, FETCH_RETRY_DELAY_US) != ESP_OK) {
+            if (ra->timer) esp_timer_delete(ra->timer);
+            free(ra->url);
+            free(ra);
+            atomic_store(&s_busy, false);
+            *code = "out_of_memory";
+            *message = "failed to start the retry timer";
+            return false;
+        }
+        return true;
     }
 
     fetch_t *f = calloc(1, sizeof(*f));

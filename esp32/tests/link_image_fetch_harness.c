@@ -63,6 +63,23 @@ int64_t esp_timer_get_time(void) {
     return g_now_us;
 }
 
+int esp_timer_create(const esp_timer_create_args_t *args, esp_timer_handle_t *out) {
+    (void)args;
+    *out = (esp_timer_handle_t)0x1;
+    return 0;
+}
+
+int esp_timer_start_once(esp_timer_handle_t timer, uint64_t us) {
+    (void)timer;
+    (void)us;
+    return 0;
+}
+
+int esp_timer_delete(esp_timer_handle_t timer) {
+    (void)timer;
+    return 0;
+}
+
 // ---- Scripted server ---------------------------------------------------------
 
 typedef struct {
