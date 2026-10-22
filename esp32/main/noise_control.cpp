@@ -16,6 +16,10 @@
 
 #include "ble_commands.h"
 #include "noise_control.h"
+// config_store.h predates C++ callers and has no linkage guards.
+extern "C" {
+#include "config_store.h"
+}
 #include "stack_monitor.h"
 #include "noise_upgrade.h"
 #include "noise_tunnel_internal.h"
@@ -187,6 +191,23 @@ static bool s_register_acked = false;
 /* Set when the server refuses this session's link.register; the event loop
  * turns it into a session-ending auth failure (see the check after RX). */
 static bool s_register_rejected = false;
+/* Registration diagnostics, persisted in the config store (NVS) at the
+ * moment a registration fails. device.health is only reachable while the
+ * device is registered, so live state can never describe the failure that
+ * already recovered — and the reboot that cures a stranded session wipes
+ * RAM. The persisted record survives: after any recovery, device.health
+ * still reports what the last failure was. */
+static void link_diag_record(const char *event, const char *detail) {
+    char buf[16];
+    int fails = 0;
+    if (config_get_str("link_diag_fails", buf, sizeof(buf))) {
+        fails = atoi(buf);
+    }
+    snprintf(buf, sizeof(buf), "%d", fails + 1);
+    config_set_str("link_diag_fails", buf);
+    config_set_str("link_diag_event", event);
+    config_set_str("link_diag_detail", detail ? detail : "");
+}
 static bool s_heartbeat_registered = false;
 static TaskHandle_t s_task = nullptr;
 
@@ -1642,6 +1663,26 @@ static void send_device_health(
                             heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(metrics, "heap_free_psram",
                             heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    // Link registration: live state plus the persisted last failure (see
+    // link_diag_record) — the part still readable after the reboot that
+    // recovered from it.
+    cJSON_AddBoolToObject(metrics, "link_registered", s_register_acked);
+    {
+        char str[128];
+        if (config_get_str("link_diag_event", str, sizeof(str))) {
+            cJSON_AddStringToObject(metrics, "link_last_event", str);
+        }
+        if (config_get_str("link_diag_detail", str, sizeof(str)) && str[0]) {
+            cJSON_AddStringToObject(metrics, "link_last_event_detail", str);
+        }
+        if (config_get_str("link_diag_fails", str, sizeof(str))) {
+            cJSON_AddNumberToObject(metrics, "link_register_failures",
+                                    atoi(str));
+        }
+        if (config_get_str("link_boots", str, sizeof(str))) {
+            cJSON_AddNumberToObject(metrics, "boot_count", atoi(str));
+        }
+    }
     cJSON *battery_pct = nullptr, *battery_mv = nullptr;
     cJSON *charging = nullptr, *usb_power = nullptr;
 #if CONFIG_MUSE_ENABLED
@@ -1919,10 +1960,18 @@ static void process_inbound_body_chunk(
                             // tunnel and the Muse can't invoke this device.
                             cJSON *reason = cJSON_IsObject(failure)
                                 ? cJSON_GetObjectItem(failure, "message") : failure;
+                            const char *reason_str =
+                                cJSON_IsString(reason) && reason->valuestring
+                                    ? reason->valuestring : "no reason given";
                             ESP_LOGE(TAG, "link.register rejected: %s",
-                                     cJSON_IsString(reason) && reason->valuestring
-                                         ? reason->valuestring : "no reason given");
+                                     reason_str);
                             s_register_rejected = true;
+                            {
+                                char detail[97];
+                                snprintf(detail, sizeof(detail), "%s",
+                                         reason_str);
+                                link_diag_record("register_rejected", detail);
+                            }
                         } else {
                             s_register_acked = true;
                             ESP_LOGI(TAG, "link.register acked; tunnel may open");
@@ -2282,6 +2331,12 @@ static session_result_t run_session(stack_monitor_t *stack) {
                      "link.register unanswered after %d ms; ending session "
                      "as an auth failure",
                      REGISTER_ACK_TIMEOUT_MS);
+            {
+                char detail[48];
+                snprintf(detail, sizeof(detail), "no ack within %d ms",
+                         REGISTER_ACK_TIMEOUT_MS);
+                link_diag_record("register_no_reply", detail);
+            }
             result = SESSION_AUTH_FAILED;
             error = true;
             break;
@@ -2494,6 +2549,18 @@ extern "C" void noise_ctrl_init(const char *node_id, const char *display_name,
     strncpy(s_node_id, node_id, sizeof(s_node_id) - 1);
     strncpy(s_display_name, display_name, sizeof(s_display_name) - 1);
     s_status_cb = on_status;
+    // Count boots in the same store the registration diagnostics use, so
+    // device.health can say how many power cycles a recorded failure has
+    // survived. app.c runs config_store_init() before this.
+    {
+        char buf[16];
+        int boots = 0;
+        if (config_get_str("link_boots", buf, sizeof(buf))) {
+            boots = atoi(buf);
+        }
+        snprintf(buf, sizeof(buf), "%d", boots + 1);
+        config_set_str("link_boots", buf);
+    }
     s_connect_mutex = xSemaphoreCreateMutex();
     s_result_q = xQueueCreate(8, sizeof(pending_result));
     req_init();
