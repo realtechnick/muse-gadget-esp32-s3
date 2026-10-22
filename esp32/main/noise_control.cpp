@@ -191,6 +191,9 @@ static bool s_register_acked = false;
 /* Set when the server refuses this session's link.register; the event loop
  * turns it into a session-ending auth failure (see the check after RX). */
 static bool s_register_rejected = false;
+/* When this session's link.register actually went out (stamped where its
+ * send completes); drives the ack deadline in the session loop. */
+static uint64_t s_register_sent_us = 0;
 /* Registration diagnostics, persisted in the config store (NVS) at the
  * moment a registration fails. device.health is only reachable while the
  * device is registered, so live state can never describe the failure that
@@ -2147,6 +2150,7 @@ static session_result_t run_session(stack_monitor_t *stack) {
     {
         s_register_acked = false;
         s_register_rejected = false;
+        s_register_sent_us = 0;
         s_heartbeat_registered = false;
         char *reg_json = build_register_json();
         if (!reg_json) {
@@ -2181,9 +2185,6 @@ static session_result_t run_session(stack_monitor_t *stack) {
     // last_rx_us tracks inbound liveness (app frames + keepalive pongs),
     // distinct from last_activity_us which also counts our TX.
     uint64_t last_rx_us = last_activity_us;
-    // When this session's link.register actually went out (stamped where its
-    // send completes); 0 until then. Drives the ack deadline in the loop.
-    uint64_t register_sent_us = 0;
     bool heartbeat_sent = false;
     uint64_t last_heartbeat_us = 0;
 
@@ -2324,8 +2325,8 @@ static session_result_t run_session(stack_monitor_t *stack) {
         // a reboot, which cured it by registering a fresh session). Treat
         // silence past the deadline as the same auth failure, so the
         // token refresh + re-register path runs for both.
-        if (!s_register_acked && register_sent_us
-            && esp_timer_get_time() - register_sent_us
+        if (!s_register_acked && s_register_sent_us
+            && esp_timer_get_time() - s_register_sent_us
                    > static_cast<uint64_t>(REGISTER_ACK_TIMEOUT_MS) * 1000) {
             ESP_LOGE(TAG,
                      "link.register unanswered after %d ms; ending session "
@@ -2403,7 +2404,7 @@ static session_result_t run_session(stack_monitor_t *stack) {
                     last_heartbeat_us = esp_timer_get_time();
                 }
                 if (control_tx.is_registration) {
-                    register_sent_us = esp_timer_get_time();
+                    s_register_sent_us = esp_timer_get_time();
                 }
                 ESP_LOGI(TAG, "sent %s (%u bytes)",
                          control_tx.is_registration ? "link.register" :

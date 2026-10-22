@@ -247,6 +247,10 @@ static bool heartbeat_sent;
 static uint64_t last_heartbeat_us;
 static void handle_invoke_request(const char *, size_t,
                                   noise_ctrl_session_generation_t) {}
+// The config store is NVS on device; registration diagnostics persist
+// there. Nothing to persist to in the harness.
+bool config_get_str(const char *, char *, size_t) { return false; }
+bool config_set_str(const char *, const char *) { return true; }
 #include "control_inbound.inc"
 static unsigned ws_pings, delays, stack_polls;
 static uint64_t last_activity_us;
