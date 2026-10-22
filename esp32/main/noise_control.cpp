@@ -82,6 +82,8 @@ static char s_noise_host[256] = NOISE_DEFAULT_HOST;
 #define RECONNECT_AUTH_FAILED_MS  60000
 #define RECONNECT_DELAY_STEP_MS   250
 #define KEEPALIVE_INTERVAL_MS     60000
+#define REGISTER_ACK_TIMEOUT_MS   30000   // link.register unanswered this long
+                                          // ends the session as an auth failure
 #define POWER_SAVE_QUIET_MS       1000    // noise_ctrl_set_power_save(): quiet this long,
 #define POWER_SAVE_POLL_MS        100     // then poll this often
 #define IDLE_QUIET_MS             50      // otherwise quiet this long,
@@ -2130,6 +2132,9 @@ static session_result_t run_session(stack_monitor_t *stack) {
     // last_rx_us tracks inbound liveness (app frames + keepalive pongs),
     // distinct from last_activity_us which also counts our TX.
     uint64_t last_rx_us = last_activity_us;
+    // When this session's link.register actually went out (stamped where its
+    // send completes); 0 until then. Drives the ack deadline in the loop.
+    uint64_t register_sent_us = 0;
     bool heartbeat_sent = false;
     uint64_t last_heartbeat_us = 0;
 
@@ -2263,6 +2268,25 @@ static session_result_t run_session(stack_monitor_t *stack) {
             break;
         }
 
+        // A register the server never answers strands this session exactly
+        // like a rejected one: session up, tunnel gated on the ack, no
+        // invoke routable, and every other recovery path waits on a state
+        // change that never comes (observed 2026-10-22: "Connecting" until
+        // a reboot, which cured it by registering a fresh session). Treat
+        // silence past the deadline as the same auth failure, so the
+        // token refresh + re-register path runs for both.
+        if (!s_register_acked && register_sent_us
+            && esp_timer_get_time() - register_sent_us
+                   > static_cast<uint64_t>(REGISTER_ACK_TIMEOUT_MS) * 1000) {
+            ESP_LOGE(TAG,
+                     "link.register unanswered after %d ms; ending session "
+                     "as an auth failure",
+                     REGISTER_ACK_TIMEOUT_MS);
+            result = SESSION_AUTH_FAILED;
+            error = true;
+            break;
+        }
+
         // TX: keep exactly one control message in flight across loop turns.
         // A paused slot prevents dequeue/serialization of the next result.
         // Unreachable today: both generations come from the same run_session
@@ -2322,6 +2346,9 @@ static session_result_t run_session(stack_monitor_t *stack) {
                 if (control_tx.is_heartbeat) {
                     heartbeat_sent = true;
                     last_heartbeat_us = esp_timer_get_time();
+                }
+                if (control_tx.is_registration) {
+                    register_sent_us = esp_timer_get_time();
                 }
                 ESP_LOGI(TAG, "sent %s (%u bytes)",
                          control_tx.is_registration ? "link.register" :
