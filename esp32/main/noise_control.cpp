@@ -1763,6 +1763,9 @@ static void send_device_health(
         if (config_get_str("link_recyc", str, sizeof(str))) {
             cJSON_AddNumberToObject(metrics, "link_recycles", atoi(str));
         }
+        if (config_get_str("link_last_session", str, sizeof(str))) {
+            cJSON_AddStringToObject(metrics, "link_last_session", str);
+        }
     }
     cJSON *battery_pct = nullptr, *battery_mv = nullptr;
     cJSON *charging = nullptr, *usb_power = nullptr;
@@ -2642,6 +2645,26 @@ cleanup:
     return result;
 }
 
+/* Session-end record: result + lifetime of every session, persisted from
+ * the session task — the one place that sees every session end, including
+ * sessions that died before link.register was ever sent. The registration
+ * diagnostics only arm at the register itself; the hard episode of
+ * 2026-10-23 (a dozen boots stuck at "Connecting", zero register
+ * records) failed in the preamble ahead of them. device.health reports
+ * the latest record. */
+static void link_session_record(session_result_t result, uint64_t up_ms)
+    __attribute__((unused));
+static void link_session_record(session_result_t result, uint64_t up_ms) {
+    char rec[96];
+    const char *name = result == SESSION_OK ? "ok"
+                     : result == SESSION_AUTH_FAILED ? "auth_failed"
+                                                     : "failed";
+    snprintf(rec, sizeof(rec), "end=%s dur_s=%lld at_up=%lld", name,
+             (long long)(up_ms / 1000),
+             (long long)(esp_timer_get_time() / 1000000));
+    config_set_str("link_last_session", rec);
+}
+
 static void noise_ctrl_task(void *arg) {
     (void)arg;
     stack_monitor_t stack = STACK_MONITOR_INIT;
@@ -2655,6 +2678,7 @@ static void noise_ctrl_task(void *arg) {
         uint64_t t0 = esp_timer_get_time();
         session_result_t result = run_session(&stack);
         uint64_t up_ms = (esp_timer_get_time() - t0) / 1000;
+        link_session_record(result, up_ms);
         if (update_reconnect_policy(result, up_ms, &backoff, &short_failures)) {
             notify_status("ws_refresh_needed");
         }
