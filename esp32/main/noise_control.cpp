@@ -88,6 +88,7 @@ static char s_noise_host[256] = NOISE_DEFAULT_HOST;
 #define KEEPALIVE_INTERVAL_MS     60000
 #define REGISTER_ACK_TIMEOUT_MS   30000   // link.register unanswered this long
                                           // ends the session as an auth failure
+#define LINK_BC_INTERVAL_US       (60LL * 1000000LL)  // session breadcrumb cadence
 #define POWER_SAVE_QUIET_MS       1000    // noise_ctrl_set_power_save(): quiet this long,
 #define POWER_SAVE_POLL_MS        100     // then poll this often
 #define IDLE_QUIET_MS             50      // otherwise quiet this long,
@@ -210,6 +211,47 @@ static void link_diag_record(const char *event, const char *detail) {
     config_set_str("link_diag_fails", buf);
     config_set_str("link_diag_event", event);
     config_set_str("link_diag_detail", detail ? detail : "");
+}
+/* Session-age and inbound stamps for the breadcrumb record (see
+ * link_bc_write). Session-task-owned, like the register state above. */
+static uint64_t s_registered_us = 0;
+static uint64_t s_last_app_rx_us = 0;
+static uint64_t s_last_bc_us = 0;
+/* Persist the latest session-life event (register, recycle) with the
+ * uptime at which it happened, in the same store as the failure record:
+ * device.health is only reachable on a healthy session, so the story of
+ * a session that already ended has to be read from what it left behind. */
+static void link_bc_event(const char *event) {
+    char buf[24];
+    config_set_str("link_bc_event", event);
+    snprintf(buf, sizeof(buf), "%lld",
+             (long long)(esp_timer_get_time() / 1000000));
+    config_set_str("link_bc_event_up", buf);
+}
+/* One session breadcrumb: what the device believes about its link right
+ * now. Ages are seconds since the last frame of each kind (-1 = none
+ * yet this session): rx_age counts any inbound frame including WS
+ * keepalive pongs, app_age only app-level messages, hb_age the last
+ * link.heartbeat sent. iters is how many times the session loop turned
+ * since the previous breadcrumb — a wedged session that spins instead
+ * of idling (one was found running hot, 2026-10-23) shows up here. */
+static void link_bc_write(uint64_t now_us, uint64_t last_rx_us,
+                          uint64_t last_hb_us, uint32_t iters) {
+    char rec[192];
+    long long rx_age = last_rx_us
+        ? (long long)((now_us - last_rx_us) / 1000000) : -1;
+    long long app_age = s_last_app_rx_us
+        ? (long long)((now_us - s_last_app_rx_us) / 1000000) : -1;
+    long long hb_age = last_hb_us
+        ? (long long)((now_us - last_hb_us) / 1000000) : -1;
+    snprintf(rec, sizeof(rec),
+             "up=%lld reg=%d rx_age=%lld app_age=%lld hb_age=%lld "
+             "heap=%u iters=%u",
+             (long long)(now_us / 1000000), s_register_acked ? 1 : 0,
+             rx_age, app_age, hb_age,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)iters);
+    config_set_str("link_bc", rec);
 }
 static bool s_heartbeat_registered = false;
 static TaskHandle_t s_task = nullptr;
@@ -1685,6 +1727,19 @@ static void send_device_health(
         if (config_get_str("link_boots", str, sizeof(str))) {
             cJSON_AddNumberToObject(metrics, "boot_count", atoi(str));
         }
+        {
+            char bc[192];
+            if (config_get_str("link_bc", bc, sizeof(bc))) {
+                cJSON_AddStringToObject(metrics, "link_breadcrumb", bc);
+            }
+        }
+        if (config_get_str("link_bc_event", str, sizeof(str))) {
+            cJSON_AddStringToObject(metrics, "link_bc_event", str);
+        }
+        if (config_get_str("link_bc_event_up", str, sizeof(str))) {
+            cJSON_AddNumberToObject(metrics, "link_bc_event_uptime_s",
+                                    atoi(str));
+        }
     }
     cJSON *battery_pct = nullptr, *battery_mv = nullptr;
     cJSON *charging = nullptr, *usb_power = nullptr;
@@ -1947,6 +2002,7 @@ static void process_inbound_body_chunk(
             break;
         }
         if (msg_len > 0) {
+            s_last_app_rx_us = esp_timer_get_time();
             // Detect the link.register reply (id matches our request) so the
             // caller can open the tunnel stream only once the server has
             // recorded this connection's device registration.
@@ -1977,6 +2033,8 @@ static void process_inbound_body_chunk(
                             }
                         } else {
                             s_register_acked = true;
+                            s_registered_us = esp_timer_get_time();
+                            link_bc_event("register");
                             ESP_LOGI(TAG, "link.register acked; tunnel may open");
                             cJSON *type = cJSON_GetObjectItem(msg, "type");
                             cJSON *reply = cJSON_GetObjectItem(msg, "result");
@@ -2151,6 +2209,8 @@ static session_result_t run_session(stack_monitor_t *stack) {
         s_register_acked = false;
         s_register_rejected = false;
         s_register_sent_us = 0;
+        s_registered_us = 0;
+        s_last_app_rx_us = 0;
         s_heartbeat_registered = false;
         char *reg_json = build_register_json();
         if (!reg_json) {
@@ -2187,6 +2247,8 @@ static session_result_t run_session(stack_monitor_t *stack) {
     uint64_t last_rx_us = last_activity_us;
     bool heartbeat_sent = false;
     uint64_t last_heartbeat_us = 0;
+    uint32_t loop_iters = 0;
+    uint32_t bc_iters_base = 0;
 
     // Tunnel data-plane stream, multiplexed on this session. Deferred: it is
     // opened from inside the loop only after the link.register reply arrives
@@ -2341,6 +2403,28 @@ static session_result_t run_session(stack_monitor_t *stack) {
             result = SESSION_AUTH_FAILED;
             error = true;
             break;
+        }
+
+        // Session breadcrumbs (v3). The registration rot observed since
+        // 2026-10-18 produces no device-side event: the register is acked,
+        // the session stays locally healthy, and ~62 minutes after boot
+        // (boot-anchored across every observed cycle) the server simply
+        // stops honoring the registration. With no event to record, state
+        // over time is the only testimony: persist one breadcrumb a
+        // minute — registration belief, inbound ages (any frame vs
+        // app-level only), heartbeat age, heap, and how hard this loop
+        // turned (a wedged cube was found running hot, 2026-10-23). The
+        // record overwrites itself and survives the reboot that cures
+        // the wedge; device.health reports the latest.
+        {
+            uint64_t now_us = esp_timer_get_time();
+            loop_iters++;
+            if (now_us - s_last_bc_us >= LINK_BC_INTERVAL_US) {
+                link_bc_write(now_us, last_rx_us, last_heartbeat_us,
+                              loop_iters - bc_iters_base);
+                bc_iters_base = loop_iters;
+                s_last_bc_us = now_us;
+            }
         }
 
         // TX: keep exactly one control message in flight across loop turns.
