@@ -89,6 +89,9 @@ static char s_noise_host[256] = NOISE_DEFAULT_HOST;
 #define REGISTER_ACK_TIMEOUT_MS   30000   // link.register unanswered this long
                                           // ends the session as an auth failure
 #define LINK_BC_INTERVAL_US       (60LL * 1000000LL)  // session breadcrumb cadence
+#define RECYCLE_AFTER_MS          (45 * 60 * 1000)  // proactively re-register
+                                                    // before the server-side
+                                                    // registration rots (~62 min)
 #define POWER_SAVE_QUIET_MS       1000    // noise_ctrl_set_power_save(): quiet this long,
 #define POWER_SAVE_POLL_MS        100     // then poll this often
 #define IDLE_QUIET_MS             50      // otherwise quiet this long,
@@ -227,6 +230,18 @@ static void link_bc_event(const char *event) {
     snprintf(buf, sizeof(buf), "%lld",
              (long long)(esp_timer_get_time() / 1000000));
     config_set_str("link_bc_event_up", buf);
+}
+/* Count a proactive session recycle (see the session loop) in the same
+ * store, and stamp it as the latest breadcrumb event. */
+static void link_recycle_record(void) {
+    char buf[16];
+    int n = 0;
+    if (config_get_str("link_recyc", buf, sizeof(buf))) {
+        n = atoi(buf);
+    }
+    snprintf(buf, sizeof(buf), "%d", n + 1);
+    config_set_str("link_recyc", buf);
+    link_bc_event("recycle");
 }
 /* One session breadcrumb: what the device believes about its link right
  * now. Ages are seconds since the last frame of each kind (-1 = none
@@ -1740,6 +1755,9 @@ static void send_device_health(
             cJSON_AddNumberToObject(metrics, "link_bc_event_uptime_s",
                                     atoi(str));
         }
+        if (config_get_str("link_recyc", str, sizeof(str))) {
+            cJSON_AddNumberToObject(metrics, "link_recycles", atoi(str));
+        }
     }
     cJSON *battery_pct = nullptr, *battery_mv = nullptr;
     cJSON *charging = nullptr, *usb_power = nullptr;
@@ -2424,6 +2442,26 @@ static session_result_t run_session(stack_monitor_t *stack) {
                               loop_iters - bc_iters_base);
                 bc_iters_base = loop_iters;
                 s_last_bc_us = now_us;
+            }
+            // Proactive recycle: end this session at 45 minutes of
+            // registration age and let the reconnect re-register, while
+            // the current registration is still honored — everything a
+            // reboot does for this bug, without the reboot. A plain
+            // SESSION_FAILED (no token refresh) is deliberate: the
+            // minimal intervention first, and if the fresh register is
+            // refused or unanswered, the rejection and deadline paths
+            // above escalate to a refresh on their own.
+            if (s_register_acked && s_registered_us
+                && now_us - s_registered_us
+                       > static_cast<uint64_t>(RECYCLE_AFTER_MS) * 1000) {
+                ESP_LOGW(TAG,
+                         "registration %lld s old; proactive session "
+                         "recycle (re-register before it rots)",
+                         (long long)((now_us - s_registered_us) / 1000000));
+                link_recycle_record();
+                result = SESSION_FAILED;
+                error = true;
+                break;
             }
         }
 
