@@ -273,7 +273,12 @@ void ota_start(const char *url, bool force, ota_status_cb cb, void *user) {
         return;
     }
     // 8 KB stack: TLS handshake + flash writes during the OTA download.
-    if (xTaskCreate(ota_task, "ota", 16384, ctx, 5, NULL) != pdPASS) {
+    // It was 16 KB for a while and device.ota could never start on the
+    // full-UI boards: a live session fragments internal RAM below a
+    // 16 KB run, so xTaskCreate refused every time (2026-10-23). 8 KB
+    // is what this firmware's HTTPS image downloads already run on, in
+    // the same heap conditions.
+    if (xTaskCreate(ota_task, "ota", 8192, ctx, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "could not start OTA task");
         free(ctx->url);
         free(ctx);
