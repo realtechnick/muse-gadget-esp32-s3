@@ -217,13 +217,14 @@ static void link_diag_record(const char *event, const char *detail) {
 }
 /* Session-age and inbound stamps for the breadcrumb record (see
  * link_bc_write). Session-task-owned, like the register state above. */
-static uint64_t s_registered_us = 0;
-static uint64_t s_last_app_rx_us = 0;
-static uint64_t s_last_bc_us = 0;
+static uint64_t s_registered_us __attribute__((unused)) = 0;
+static uint64_t s_last_app_rx_us __attribute__((unused)) = 0;
+static uint64_t s_last_bc_us __attribute__((unused)) = 0;
 /* Persist the latest session-life event (register, recycle) with the
  * uptime at which it happened, in the same store as the failure record:
  * device.health is only reachable on a healthy session, so the story of
  * a session that already ended has to be read from what it left behind. */
+static void link_bc_event(const char *event) __attribute__((unused));
 static void link_bc_event(const char *event) {
     char buf[24];
     config_set_str("link_bc_event", event);
@@ -233,6 +234,7 @@ static void link_bc_event(const char *event) {
 }
 /* Count a proactive session recycle (see the session loop) in the same
  * store, and stamp it as the latest breadcrumb event. */
+static void link_recycle_record(void) __attribute__((unused));
 static void link_recycle_record(void) {
     char buf[16];
     int n = 0;
@@ -251,7 +253,11 @@ static void link_recycle_record(void) {
  * since the previous breadcrumb — a wedged session that spins instead
  * of idling (one was found running hot, 2026-10-23) shows up here. */
 static void link_bc_write(uint64_t now_us, uint64_t last_rx_us,
-                          uint64_t last_hb_us, uint32_t iters) {
+                          uint64_t last_hb_us, uint32_t heap_free,
+                          uint32_t iters) __attribute__((unused));
+static void link_bc_write(uint64_t now_us, uint64_t last_rx_us,
+                          uint64_t last_hb_us, uint32_t heap_free,
+                          uint32_t iters) {
     char rec[192];
     long long rx_age = last_rx_us
         ? (long long)((now_us - last_rx_us) / 1000000) : -1;
@@ -263,8 +269,7 @@ static void link_bc_write(uint64_t now_us, uint64_t last_rx_us,
              "up=%lld reg=%d rx_age=%lld app_age=%lld hb_age=%lld "
              "heap=%u iters=%u",
              (long long)(now_us / 1000000), s_register_acked ? 1 : 0,
-             rx_age, app_age, hb_age,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             rx_age, app_age, hb_age, (unsigned)heap_free,
              (unsigned)iters);
     config_set_str("link_bc", rec);
 }
@@ -2439,6 +2444,7 @@ static session_result_t run_session(stack_monitor_t *stack) {
             loop_iters++;
             if (now_us - s_last_bc_us >= LINK_BC_INTERVAL_US) {
                 link_bc_write(now_us, last_rx_us, last_heartbeat_us,
+                              heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                               loop_iters - bc_iters_base);
                 bc_iters_base = loop_iters;
                 s_last_bc_us = now_us;
